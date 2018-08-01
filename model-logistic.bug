@@ -1,0 +1,27 @@
+data {
+  dimY <- dim(FGM)
+}
+
+model {
+
+  for (i in 1:dimY[1]) {
+
+    for (j in 1:dimY[2]) {
+
+      FGM[i,j] ~ dbin(prob[i, j], FGA[i, j])
+      logit(prob[i, j]) <- beta.Year[i]*Yr.Exper[i, j] + Player.Effect[i]
+
+
+      FGMrep[i,j] ~ dbin(prob[i, j], FGA[i, j])
+    }
+
+
+      beta.Year[i] ~ dt(0, 0.16, 1)
+      Player.Effect[i] ~ dnorm(mu, 1/sigmaPE^2)
+  }
+
+  mu ~ dt(0, 0.01, 1)
+
+  sigmaPE ~ dunif(0, 100)
+
+}

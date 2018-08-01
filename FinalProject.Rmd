@@ -1,0 +1,796 @@
+---
+title: "Estimating the shooting efficiency of top NBA point guard"
+author: "Xiang Gao, Jerome Finn, Nilesh Malpekar"
+date: "2017/12/03"
+fontsize: 11pt
+output:
+  pdf_document: default
+---
+```{r, echo=FALSE, eval=FALSE, warning=FALSE, message=FALSE}
+install.packages("dplyr")
+install.packages("gridExtra")
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+library(rjags)
+library(coda)
+library(lattice)
+library(gridExtra)
+library(ggplot2)
+library(dplyr)
+library(knitr)
+```
+
+# Purpose
+
+## Background 
+
+As we all know,a point guard controls the court by passing the ball to the player who is wide open. He is a decision maker to deliver assists or finish the attack by himself. The question arises, who has the highest shooting percentage among the top NBA point guards. Is this related to the professional years of experience?
+
+We are using logistic regression to assess the probablity of shooting, also use a binomial model to estimate field goals made by the NBA players. In order to build a hierachical model, each player is treated as a individual group by introducing a random effect called player effect. What's more, recent three years data will be used to check the continuous improvement.
+
+# Data
+
+## Original data
+
+Original data is retrieved from Kaggle competition site [NBA Dataset](https://www.kaggle.com/drgilermo/nba-players-stats/downloads/nba-players-stats-since-1950.zip). Using our homework datasets as a guide, Xiang got our data set to manageable level for our questions. We concentrate on players and years with players representing groups similar to how rats where used as groups in our previous lectures. 
+
+The zip file contains two separate CSV files:
+
+* Seasons_Stats.csv - season specific data since 1950
+* Players.csv - player specific data
+
+```{r, message=FALSE, warning=FALSE}
+season_data <- read.table("Seasons_Stats.csv", header=TRUE, sep = ",", quote = '"')
+```
+
+For this project, we are focusing on specific fields within the `season_data` dataset which are described beow:
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+data_meta <- data.frame( 
+  Datasource = rep("Seasons_Stats", 5),
+  Field_Name = c("Year", "Player", "Pos", "FG", "FGA"),
+  Description = c("NBA year", "Player name", "Player position", 
+                  "Field Goals", "Field Goals Attempted")
+  )
+kable(data_meta)
+```
+
+The dataset contains duplicate rows for multiple players for the same year. As part of the data preparation, we have removed duplicate rows based on **Year** and **Player**.
+
+```{r, message=FALSE, warning=FALSE}
+season_data <- season_data[with(season_data, order(Year, Player, -FG)), ]
+season_data <- distinct(season_data, Year, Player, .keep_all = TRUE)
+```
+
+## Feature creation
+
+For this project, we need to extract following two features from the original dataset
+
+* **Experience** as number of years of NBA experience.
+* **FG%** as ${Field Goals}/{Field Goals Attempted}$
+
+```{r, message=FALSE, warning=FALSE}
+season_data <- season_data %>% group_by(Player) %>% mutate(EXP = 1:n())
+season_data[, "FG%"] <- season_data$FG / season_data$FGA
+```
+
+## Preparing modeling data
+
+For our project, we decided to use the data for the last 3 NBA seasons, i.e. 2017, 2016 and 2015.
+
+The data so far is in long format, i.e. for each player there is one row per year. However, we need daa in wide format so that there is a single row per player and year specific attributes should be columns in the dataset. As an example for **FG** (Field Goals) columns should be as follows:
+
+* latest year: FG_0
+* 1st prior year: FG_PRIOR_1
+* Nth prior year: FG_PRIOR_N
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# interested positions
+INTERESTED_POSITIONS <- c("PG")
+
+# interested years
+INTERESTED_YEARS <- c(2015, 2016, 2017)
+YEAR_COUNT <- length(INTERESTED_YEARS)
+
+# columns that don't change per year
+COMMON_COLUMNS <- c("Player", "Pos")
+
+# interested observations per year
+YEARLY_COLUMNS <- c("FG", "FGA", "EXP", "FG%")
+
+# orignal source select columns
+SELECT_COLUMNS <- c(COMMON_COLUMNS, "Year", YEARLY_COLUMNS)
+
+# returns column year suffix as "_0", "_PRIOR_1", "_PRIOR_2", ..., "_PRIOR_{N-1}"
+get_column_year_suffix <- function(num_years) {
+  year_suffix <- c("_0", paste("_PRIOR_", 1:(num_years - 1), sep = ""))
+  return (year_suffix)  
+}
+
+# returns column names as "{COL_NAME}_0", "{COL_NAME}_PRIOR_1", "{COL_NAME}_PRIOR_2", ...  
+get_column_names <- function(col_name, num_years) {
+  suffix <- get_column_year_suffix(num_years)
+  column_names <- paste(col_name, suffix, sep = "")
+  return (column_names)
+}
+
+# returns modeling data for given year, positions and age
+get_model_data_wide <- function(season_data, years, positions, minFG) {
+  num_years <- length(years)
+  sorted_years <- sort(years, decreasing = TRUE)
+  yearly_suffix <- get_column_year_suffix(num_years)
+  suppressWarnings(rm(wide_data))
+
+  last_n_seasons <- subset(season_data, Year %in% years, 
+      select = c(COMMON_COLUMNS, c("Year"), YEARLY_COLUMNS))
+
+  if (! missing(positions)) {
+    last_n_seasons <- subset(last_n_seasons, Pos %in% positions, 
+      select = c(COMMON_COLUMNS, c("Year"), YEARLY_COLUMNS))
+  }
+  
+  if (! missing(minFG)) {
+    last_n_seasons <- subset(last_n_seasons, FG >= minFG, 
+      select = c(COMMON_COLUMNS, c("Year"), YEARLY_COLUMNS))
+  }
+  
+  for (year_idx in 1:num_years) {
+    year <- sorted_years[year_idx]
+    yearly_data <- subset(last_n_seasons, Year == year, select = -c(Year))
+    colnames(yearly_data) <- c(COMMON_COLUMNS, paste(YEARLY_COLUMNS, yearly_suffix[year_idx], sep = ""))
+
+    if (exists("wide_data")) {
+      wide_data <- merge(wide_data, yearly_data, by = COMMON_COLUMNS)
+    } else {
+      wide_data <- yearly_data
+    }
+  }
+  
+  wide_data$Pos <- factor(wide_data$Pos)
+
+  return(wide_data)
+}
+
+# converts long format to wide format
+wide_data_to_long_data <- function(wide_data, years) {
+  num_years <- length(years)
+  sorted_years <- sort(years, decreasing = TRUE)
+  yearly_suffix <- get_column_year_suffix(num_years)
+
+  suppressWarnings(rm(long_data))
+  
+  for (year_idx in 1:num_years) {
+    year <- sorted_years[year_idx]
+    yearly_data <- subset(wide_data, select = c(COMMON_COLUMNS, paste(YEARLY_COLUMNS, yearly_suffix[year_idx], sep = "")))
+    
+    colnames(yearly_data) <- c(COMMON_COLUMNS, YEARLY_COLUMNS)
+    yearly_data$Year = year
+    
+    if (exists("long_data")) {
+      long_data <- rbind(long_data, yearly_data)
+    } else {
+      long_data <- yearly_data
+    }
+  }
+  
+  return(long_data)
+}
+```
+
+```{r, message=FALSE, warning=FALSE}
+# get modeling data
+model_data <- get_model_data_wide(season_data, INTERESTED_YEARS, 
+                INTERESTED_POSITIONS, 300)
+model_data_row_count <- nrow(model_data)
+display_column_names <- c("Player", get_column_names("FG", YEAR_COUNT), 
+                get_column_names("FGA", YEAR_COUNT))
+head(model_data[, display_column_names])
+```
+
+## Modeling data visualization
+
+The chart below shows field goals for each player per year. For most player there is growth in field goals from previous year to next year.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+model_data_long <- wide_data_to_long_data(model_data, INTERESTED_YEARS)
+ggplot(data = model_data_long, aes(x=Year, y=FG)) + geom_line(aes(colour=Player))
+```
+
+# Model
+  
+## Notation  
+
+\begin{center}
+$y_{ij}$ = Shooting rate of player i at year j 
+$x_1$ = 2017, $x_2$ = 2016, $x_3$ = 2015  
+  
+$y_i$ | $\beta$, $X_i$ ~ indep. Bin($n_i$, $p_i$)  
+logit($p_i$) = $X_i$$\beta$ + $\epsilon_i$,  
+
+$\epsilon_i$ ~ iid N(0, $\sigma_{\epsilon}^2$)  
+\end{center}
+  
+## DAG Model  
+  
+![I represents the players(groups) and J the years](DAG_epsilon.jpg)
+ 
+## Code  
+JAGS model. I will use scaled-t1 on coefficients in beta. and a flat uniform distribution for sigma of player effect
+```{r,eval=F}
+data {
+  dimY <- dim(FGM)
+}
+model {
+  for (i in 1:dimY[1]) { ## row per player; total 8 players
+    for (j in 1:dimY[2]) { ## column per year; total 3 years i.e. 2017, 2016, 2015
+      FGM[i,j] ~ dbin(prob[i,j], FGA[i,j])
+      logit(prob[i,j]) <- beta.Year[i]*Yr.Exper[i,j]+Player.Effect[i]
+      FGMrep[i,j] ~ dbin(prob[i,j],FGA[i,j])
+    }
+    beta.Year[i] ~ dt(0,0.16,1)
+    Player.Effect[i] ~ dnorm(mu, 1/sigmaPE^2)
+  }
+  mu ~ dt(0,0.01,1)
+  sigmaPE ~ dunif(0,100)
+}
+```
+
+# Computation
+
+## Prepare data binding
+
+Subset out the FGM(field goal made),FGA(field goal attempt),Yr.Exper(Years of professional experience)
+
+```{r, message=FALSE, warning=FALSE}
+d1 <- list(FGM = model_data[, get_column_names("FG", YEAR_COUNT)],
+           FGA = model_data[,get_column_names("FGA", YEAR_COUNT)],
+           Yr.Exper = model_data[,get_column_names("EXP", YEAR_COUNT)])
+
+inits1 <- list(list(beta.Year=rep(-1, model_data_row_count), mu=10, sigmaPE=0.001, 
+                    .RNG.name = "base::Marsaglia-Multicarry", .RNG.seed = 123),
+               list(beta.Year=rep(-1, model_data_row_count), mu=-10, sigmaPE=99, 
+                    .RNG.name = "base::Marsaglia-Multicarry", .RNG.seed = 234),
+               list(beta.Year=rep(-1, model_data_row_count), mu=10, sigmaPE=99, 
+                    .RNG.name = "base::Marsaglia-Multicarry", .RNG.seed = 345),
+               list(beta.Year=rep(-1, model_data_row_count), mu=-10, sigmaPE=0.01, 
+                    .RNG.name = "base::Marsaglia-Multicarry", .RNG.seed = 456))
+```
+
+## Build model
+  
+```{r, message=FALSE, warning=FALSE}
+m1 <- jags.model('model-logistic.bug', d1, inits = inits1, n.chains = 4, n.adapt = 1000)
+```
+
+## Burn-ins and check for convergence
+
+We tried various values to speed convergence. None lead to very fast convergence but the above values, after much trial and error, were finally acceptable. Still it took a burn-in of over 1 million iterations to get convergence.
+
+```{r, message=FALSE, warning=FALSE}
+update(m1, 1024000)
+```
+
+## Posterior samples and Gelman Statistic
+
+```{r, message=FALSE, warning=FALSE}
+x1 <- coda.samples(m1,c('beta.Year','Player.Effect'), n.iter = 70000)
+```
+```{r, message=FALSE, warning=FALSE}
+g.d <- gelman.diag(x1, autoburnin = F)
+```
+Gelman-Rubin statistic value is `r g.d$mpsrf`. 
+
+For details on individual parameters and Gelman plots, please refer to the appendix.
+
+## Effective samples sizes are adequate.
+
+```{r, message=FALSE, warning=FALSE}
+e.s <- effectiveSize(x1)
+all(e.s > 400)
+```
+
+For details on individual sample sizes, please refer to the appendix.
+
+## Retrieve replicate dataset and probabilities
+
+```{r, message=FALSE, warning=FALSE}
+x2 <- coda.samples(m1, c('beta.Year','Player.Effect','prob','FGMrep'), 
+                   n.iter = 70000, thin=40)
+```
+
+# Model Assessment 
+
+## Coda summary
+
+```{r, message=FALSE, warning=FALSE}
+s.x2 <- summary(x2)
+```
+### Beta statistics
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+stat_colnames <- c(paste("beta.Year[", 1:model_data_row_count, "]", sep = ""), paste("Player.Effect[", 1:model_data_row_count, "]", sep = ""))
+beta.statistic <- subset(s.x2$statistics, rownames(s.x2$statistics) %in% stat_colnames)
+kable(beta.statistic)
+```
+
+### Beta Quantiles
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+beta.quantiles <- subset(s.x2$quantiles, rownames(s.x2$quantiles) %in% stat_colnames)
+kable(beta.quantiles)
+```
+
+For details on the coda summary, please refer to the appendix.
+
+## Check overdispersion, chi-square discrepancy
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+df <- as.matrix(x2)
+
+get_posterior_columns <- function(col_name, i, j) {
+  suppressWarnings(rm(columns.v))
+  
+  for (j1 in 1:j) {
+    temp <- paste( col_name, "[", 1:i, ",", j1, "]", sep = "")
+    
+    if (exists("columns.v")) {
+      columns.v <- c(columns.v, temp)
+    } else {
+      columns.v <- temp
+    }
+  }
+  return(columns.v)
+}
+probs <-  df[, get_posterior_columns("prob", model_data_row_count, YEAR_COUNT)]
+FGMrep <-  df[, get_posterior_columns("FGMrep", model_data_row_count, YEAR_COUNT)]
+FGM.v <- unlist(d1$FGM)
+FGA.v <- unlist(d1$FGA)
+
+Tchi <- matrix(NA, nrow(FGMrep), model_data_row_count * YEAR_COUNT)
+Tchirep <- matrix(NA, nrow(FGMrep), model_data_row_count * YEAR_COUNT)
+for (s in 1:nrow(FGMrep)){
+  Tchi[s,] <- sum((FGM.v - FGA.v * probs[s,])^2 / (FGA.v * probs[s,] * (1-probs[s,])))
+  Tchirep[s,] <- sum((FGMrep[s,] - FGA.v * probs[s,])^2 / (FGA.v * probs[s,] * (1-probs[s,])))
+}
+```
+
+No over dispersion problem as `r mean(Tchirep >= Tchi)`.
+
+## Marginal posterior p-value
+
+Here we are checking the marginal posterior predictive p-value of (FGMrep[i] > y[i]). Effectively, comparing replicated data to our model’s actual data. The closer we get to 1 or 0, the more the model is off.
+
+```{r, echo=FALSE,message=FALSE, warning=FALSE}
+FGM.p2017 <- numeric(model_data_row_count)
+FGM.p2016 <- numeric(model_data_row_count)
+FGM.p2015 <- numeric(model_data_row_count)
+
+for (s in 1:model_data_row_count) {
+  col_index <- which(colnames(FGMrep) == paste("FGMrep[", s, ",1]", sep = ""))
+  FGM.p2017[s] <- mean(FGMrep[,  col_index] >= model_data[s, "FG_0"])
+  
+  col_index <- which(colnames(FGMrep) == paste("FGMrep[", s, ",2]", sep = ""))
+  FGM.p2016[s] <- mean(FGMrep[,  col_index] >= model_data[s, "FG_PRIOR_1"])
+  
+  col_index <- which(colnames(FGMrep) == paste("FGMrep[", s, ",3]", sep = ""))
+  FGM.p2015[s] <- mean(FGMrep[,  col_index] >= model_data[s, "FG_PRIOR_2"])     
+}
+posterior_p_df <- data.frame( Player = model_data$Player,
+    pValue.2017 = FGM.p2017,
+    pValue.2016 = FGM.p2016,
+    pValue.2015 = FGM.p2015
+    )
+kable(posterior_p_df)
+```
+
+We can see that the model looks good for Elfrid Payton, but for the other players we are not too precise. The evidence is not strong that years of experience effect a higher rate of field goals made per field goals attempted.
+
+# Results
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+ilogit <-  function(x) 1/(1+exp(-x))
+
+get_player_posterior_probs <- function(df, data, player_row_id) {
+  beta.Year <- df[,paste('beta.Year[', player_row_id, ']', sep = '')]
+  player.Effect <- df[,paste('Player.Effect[', player_row_id, ']', sep = '')]
+  
+  ## HARD_CODED to 3 
+  posterior_0 <- numeric(nrow(df))
+  posterior_PRIOR_1 <- numeric(nrow(df))
+  posterior_PRIOR_2 <- numeric(nrow(df))
+  
+  ## HARD_CODED to Experience
+  col_names <- get_column_names("EXP", YEAR_COUNT)
+  
+  for (s in 1:nrow(df)) {
+    posterior_0[s] <- ilogit(beta.Year[s] * data[player_row_id, col_names[1]] + player.Effect[s])
+    posterior_PRIOR_1[s] <- ilogit(beta.Year[s] * data[player_row_id, col_names[2]] + player.Effect[s])
+    posterior_PRIOR_2[s] <- ilogit(beta.Year[s] * data[player_row_id, col_names[3]] + player.Effect[s])
+  }
+  posterior <- cbind(posterior_0, posterior_PRIOR_1, posterior_PRIOR_2)
+  
+  return(posterior)
+}
+
+get_player_posterior_vs_observed <- function(data, player_row_id, posterior) {
+  posterior_means <- apply(posterior, 2, mean)
+
+  df_compare <- data.frame(posterior = as.vector(posterior_means), 
+                             observed = as.vector(as.matrix(data[player_row_id, get_column_names("FG%", YEAR_COUNT)])))
+  rownames(df_compare) <- get_column_names("YEAR", YEAR_COUNT)
+
+  return (df_compare)
+}
+
+plot_player_posterior_probs <- function(data, player_row_id, posterior) {
+  fg_column_names <- get_column_names("FG%", YEAR_COUNT)
+  
+  plot1 <- densityplot(posterior[,"posterior_0"],
+            panel = function(x, ...) {
+             panel.densityplot(x, ...)
+              panel.abline(v = mean(x), col.line = "blue")
+              panel.abline(v = data[player_row_id, fg_column_names[1]], col.line = "red")
+            },
+            xlab = paste("Posterior probability", INTERESTED_YEARS[1])
+            )
+  plot2 <- densityplot(posterior[,"posterior_PRIOR_1"],
+            panel = function(x, ...) {
+             panel.densityplot(x, ...)
+              panel.abline(v = mean(x), col.line = "blue")
+              panel.abline(v = data[player_row_id, fg_column_names[2]], col.line = "red")
+            },
+            xlab = paste("Posterior probability", INTERESTED_YEARS[2])
+            )
+  plot3 <- densityplot(posterior[,"posterior_PRIOR_2"],
+            panel = function(x, ...) {
+             panel.densityplot(x, ...)
+              panel.abline(v = mean(x), col.line = "blue")
+              panel.abline(v = data[player_row_id, fg_column_names[3]], col.line = "red")
+            },
+            xlab = paste("Posterior probability", INTERESTED_YEARS[3])
+            )
+  
+  grid.arrange(plot1, plot2, plot3, ncol = 3, nrow = 1)
+}
+```
+
+## Density of Various Player through the Years
+
+If we look as Stephen Curry's density plots we see no improvement in his performance over the 3 years examined. This was the case with most of our players
+  
+```{r, message=FALSE, warning=FALSE}
+player_row_id <- which(model_data$Player == "Stephen Curry")
+# posterior prob
+posterior <- get_player_posterior_probs(df, model_data, player_row_id)
+df_posterior_observed <- get_player_posterior_vs_observed(model_data, player_row_id, posterior)
+kable(df_posterior_observed)
+```
+
+The posterior density does not show Stephen's improvement of making a field goal, let's also check Russell Westbrook.
+
+```{r, message=FALSE, warning=FALSE, fig.height=4, fig.width=10}
+plot_player_posterior_probs(model_data, player_row_id, posterior)
+```
+
+Check Elfrid Payton successfully makes an attempted field goal for the past three years.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+player_row_id <- which(model_data$Player == "Elfrid Payton")
+# posterior prob
+posterior <- get_player_posterior_probs(df, model_data, player_row_id)
+df_posterior_observed <- get_player_posterior_vs_observed(model_data, player_row_id, posterior)
+kable(df_posterior_observed)
+```
+
+```{r, message=FALSE, warning=FALSE, fig.height=4, fig.width=10}
+plot_player_posterior_probs(model_data, player_row_id, posterior)
+```
+
+Check Kyrie Irving successfully makes an attempted field goal for the past three years.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+player_row_id <- which(model_data$Player == "Kyrie Irving")
+posterior <- get_player_posterior_probs(df, model_data, player_row_id)
+df_posterior_observed <- get_player_posterior_vs_observed(model_data, player_row_id, posterior)
+kable(df_posterior_observed)
+```
+
+```{r, message=FALSE, warning=FALSE, fig.height=4, fig.width=10}
+plot_player_posterior_probs(model_data, player_row_id, posterior)
+```
+
+## Posterior Odds
+
+Here we show the posterior odds of each player improving from one year to the next. We take our poster sample for each player, and take the mean of comparing one year's vector being greater than the previous.
+As we can see the odds are not extreme that a player may improve from one year to the next, nor do we have a clear pattern. The model does not support the proposition that players improve from one year to another.   
+  
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+postodds <- data.frame(matrix(NA, model_data_row_count, ncol=2))
+for (i in 1:model_data_row_count) {
+  post_prob <- get_player_posterior_probs(df, model_data, i)
+  postodds[i,] <- c(mean(post_prob[,1] > post_prob[,2]), mean(post_prob[,2] > post_prob[,1]))
+}
+postodds <- cbind(model_data$Player, postodds)
+names(postodds) <- c("Player", "2016-2017", "2015-2016")
+kable(postodds)
+```
+
+## Conclusion
+
+This project shows that the shooting accuracy doesn't have a statistically significant relationship with years of professional experience. The player's personal effect is still the major impact. This is related to the individual player to make a better decision not to pass but taking over and make an attempted basket.
+
+# Contributions
+    
+Xiang deserves a bulk of the credit as the idea was his and did the data gathering and model design, as well a first pass at much of the analysis. We all contributed to the final analysis, although Nilesh did much to improve the R coding. Jerry also contributed to the analysis and lead on much of the early work with regards to putting together the proposal and video presenation with the team's input. 
+  
+\pagebreak
+
+# References
+
+* [NBA players stats since 1950](https://www.kaggle.com/drgilermo/nba-players-stats)
+
+* [NBA Dataset](https://www.kaggle.com/drgilermo/nba-players-stats/downloads/nba-players-stats-since-1950.zip)
+
+* [Basketball reference glossary](https://www.basketball-reference.com/about/glossary.html)
+
+# Appendix
+
+## Gelman-Rubin statistic details
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+g.d$psrf
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+gelman.plot(x1)
+```
+
+## Effective sample size details
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+e.s
+```
+
+## Coda summary details
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+s.x2
+```
+
+## R code
+
+### Data preperation code
+
+```{r, eval=FALSE, message=FALSE, warning=FALSE}
+# returns column year suffix as "_0", "_PRIOR_1", "_PRIOR_2", ..., "_PRIOR_{N-1}"
+get_column_year_suffix <- function(num_years) {
+  year_suffix <- c("_0", paste("_PRIOR_", 1:(num_years - 1), sep = ""))
+  return (year_suffix)  
+}
+
+# returns column names as "{COL_NAME}_0", "{COL_NAME}_PRIOR_1", "{COL_NAME}_PRIOR_2", ...  
+get_column_names <- function(col_name, num_years) {
+  suffix <- get_column_year_suffix(num_years)
+  column_names <- paste(col_name, suffix, sep = "")
+  return (column_names)
+}
+
+# returns modeling data for given year, positions and age
+get_model_data_wide <- function(season_data, years, positions, minFG) {
+  num_years <- length(years)
+  sorted_years <- sort(years, decreasing = TRUE)
+  yearly_suffix <- get_column_year_suffix(num_years)
+  suppressWarnings(rm(wide_data))
+
+  last_n_seasons <- subset(season_data, Year %in% years, 
+      select = c(COMMON_COLUMNS, c("Year"), YEARLY_COLUMNS))
+
+  if (! missing(positions)) {
+    last_n_seasons <- subset(last_n_seasons, Pos %in% positions, 
+      select = c(COMMON_COLUMNS, c("Year"), YEARLY_COLUMNS))
+  }
+  
+  if (! missing(minFG)) {
+    last_n_seasons <- subset(last_n_seasons, FG >= minFG, 
+      select = c(COMMON_COLUMNS, c("Year"), YEARLY_COLUMNS))
+  }
+  
+  for (year_idx in 1:num_years) {
+    year <- sorted_years[year_idx]
+    yearly_data <- subset(last_n_seasons, Year == year, select = -c(Year))
+    colnames(yearly_data) <- c(COMMON_COLUMNS, paste(YEARLY_COLUMNS, 
+        yearly_suffix[year_idx], sep = ""))
+
+    if (exists("wide_data")) {
+      wide_data <- merge(wide_data, yearly_data, by = COMMON_COLUMNS)
+    } else {
+      wide_data <- yearly_data
+    }
+  }
+  
+  wide_data$Pos <- factor(wide_data$Pos)
+
+  return(wide_data)
+}
+
+# converts long format to wide format
+wide_data_to_long_data <- function(wide_data, years) {
+  num_years <- length(years)
+  sorted_years <- sort(years, decreasing = TRUE)
+  yearly_suffix <- get_column_year_suffix(num_years)
+
+  suppressWarnings(rm(long_data))
+  
+  for (year_idx in 1:num_years) {
+    year <- sorted_years[year_idx]
+    yearly_data <- subset(wide_data, select = c(COMMON_COLUMNS, 
+        paste(YEARLY_COLUMNS, yearly_suffix[year_idx], sep = "")))
+    
+    colnames(yearly_data) <- c(COMMON_COLUMNS, YEARLY_COLUMNS)
+    yearly_data$Year = year
+    
+    if (exists("long_data")) {
+      long_data <- rbind(long_data, yearly_data)
+    } else {
+      long_data <- yearly_data
+    }
+  }
+  
+  return(long_data)
+}
+```
+
+### Model data visualization
+
+```{r, eval=FALSE, message=FALSE, warning=FALSE}
+model_data_long <- wide_data_to_long_data(model_data, INTERESTED_YEARS)
+ggplot(data = model_data_long, aes(x=Year, y=FG)) + geom_line(aes(colour=Player))
+```
+
+### Check overdispersion, chi-square discrepancy
+
+```{r, eval=FALSE, message=FALSE, warning=FALSE}
+df <- as.matrix(x2)
+
+get_posterior_columns <- function(col_name, i, j) {
+  suppressWarnings(rm(columns.v))
+  
+  for (j1 in 1:j) {
+    temp <- paste( col_name, "[", 1:i, ",", j1, "]", sep = "")
+    
+    if (exists("columns.v")) {
+      columns.v <- c(columns.v, temp)
+    } else {
+      columns.v <- temp
+    }
+  }
+  return(columns.v)
+}
+probs <-  df[, get_posterior_columns("prob", model_data_row_count, YEAR_COUNT)]
+FGMrep <-  df[, get_posterior_columns("FGMrep", model_data_row_count, YEAR_COUNT)]
+FGM.v <- unlist(d1$FGM)
+FGA.v <- unlist(d1$FGA)
+
+Tchi <- matrix(NA, nrow(FGMrep), model_data_row_count * YEAR_COUNT)
+Tchirep <- matrix(NA, nrow(FGMrep), model_data_row_count * YEAR_COUNT)
+for (s in 1:nrow(FGMrep)){
+  Tchi[s,] <- sum((FGM.v - FGA.v * probs[s,])^2 / 
+                    (FGA.v * probs[s,] * (1-probs[s,])))
+  Tchirep[s,] <- sum((FGMrep[s,] - FGA.v * probs[s,])^2 / 
+                       (FGA.v * probs[s,] * (1-probs[s,])))
+}
+```
+
+### Marginal posterior p-value
+
+```{r, eval=FALSE,message=FALSE, warning=FALSE}
+FGM.p2017 <- numeric(model_data_row_count)
+FGM.p2016 <- numeric(model_data_row_count)
+FGM.p2015 <- numeric(model_data_row_count)
+
+for (s in 1:model_data_row_count) {
+  col_index <- which(colnames(FGMrep) == paste("FGMrep[", s, ",1]", sep = ""))
+  FGM.p2017[s] <- mean(FGMrep[,  col_index] >= model_data[s, "FG_0"])
+  
+  col_index <- which(colnames(FGMrep) == paste("FGMrep[", s, ",2]", sep = ""))
+  FGM.p2016[s] <- mean(FGMrep[,  col_index] >= model_data[s, "FG_PRIOR_1"])
+  
+  col_index <- which(colnames(FGMrep) == paste("FGMrep[", s, ",3]", sep = ""))
+  FGM.p2015[s] <- mean(FGMrep[,  col_index] >= model_data[s, "FG_PRIOR_2"])     
+}
+posterior_p_df <- data.frame( Player = model_data$Player,
+    pValue.2017 = FGM.p2017,
+    pValue.2016 = FGM.p2016,
+    pValue.2015 = FGM.p2015
+    )
+kable(posterior_p_df)
+```
+
+### Posterior related utility functions
+
+```{r, eval=FALSE, message=FALSE, warning=FALSE}
+ilogit <-  function(x) 1/(1+exp(-x))
+
+get_player_posterior_probs <- function(df, data, player_row_id) {
+  beta.Year <- df[,paste('beta.Year[', player_row_id, ']', sep = '')]
+  player.Effect <- df[,paste('Player.Effect[', player_row_id, ']', sep = '')]
+  
+  ## HARD_CODED to 3 
+  posterior_0 <- numeric(nrow(df))
+  posterior_PRIOR_1 <- numeric(nrow(df))
+  posterior_PRIOR_2 <- numeric(nrow(df))
+  
+  ## HARD_CODED to Experience
+  col_names <- get_column_names("EXP", YEAR_COUNT)
+  
+  for (s in 1:nrow(df)) {
+    posterior_0[s] <- ilogit(beta.Year[s] * data[player_row_id, 
+        col_names[1]] + player.Effect[s])
+    posterior_PRIOR_1[s] <- ilogit(beta.Year[s] * data[player_row_id, 
+        col_names[2]] + player.Effect[s])
+    posterior_PRIOR_2[s] <- ilogit(beta.Year[s] * data[player_row_id, 
+        col_names[3]] + player.Effect[s])
+  }
+  posterior <- cbind(posterior_0, posterior_PRIOR_1, posterior_PRIOR_2)
+  
+  return(posterior)
+}
+
+get_player_posterior_vs_observed <- function(data, player_row_id, posterior) {
+  posterior_means <- apply(posterior, 2, mean)
+
+  df_compare <- data.frame(posterior = as.vector(posterior_means), 
+      observed = as.vector(as.matrix(
+      data[player_row_id, get_column_names("FG%", YEAR_COUNT)])))
+  rownames(df_compare) <- get_column_names("YEAR", YEAR_COUNT)
+
+  return (df_compare)
+}
+
+plot_player_posterior_probs <- function(data, player_row_id, posterior) {
+  fg_column_names <- get_column_names("FG%", YEAR_COUNT)
+  
+  plot1 <- densityplot(posterior[,"posterior_0"],
+            panel = function(x, ...) {
+             panel.densityplot(x, ...)
+              panel.abline(v = mean(x), col.line = "blue")
+              panel.abline(v = data[player_row_id, fg_column_names[1]], 
+                           col.line = "red")
+            },
+            xlab = paste("Posterior probability", INTERESTED_YEARS[1])
+            )
+  plot2 <- densityplot(posterior[,"posterior_PRIOR_1"],
+            panel = function(x, ...) {
+             panel.densityplot(x, ...)
+              panel.abline(v = mean(x), col.line = "blue")
+              panel.abline(v = data[player_row_id, fg_column_names[2]], 
+                           col.line = "red")
+            },
+            xlab = paste("Posterior probability", INTERESTED_YEARS[2])
+            )
+  plot3 <- densityplot(posterior[,"posterior_PRIOR_2"],
+            panel = function(x, ...) {
+             panel.densityplot(x, ...)
+              panel.abline(v = mean(x), col.line = "blue")
+              panel.abline(v = data[player_row_id, fg_column_names[3]], 
+                           col.line = "red")
+            },
+            xlab = paste("Posterior probability", INTERESTED_YEARS[3])
+            )
+  
+  grid.arrange(plot1, plot2, plot3, ncol = 3, nrow = 1)
+}
+```
+
+### Posterior odds
+
+```{r, eval=FALSE, message=FALSE, warning=FALSE}
+postodds <- data.frame(matrix(NA, model_data_row_count, ncol=2))
+for (i in 1:model_data_row_count) {
+  post_prob <- get_player_posterior_probs(df, model_data, i)
+  postodds[i,] <- c(mean(post_prob[,1] > post_prob[,2]), 
+                    mean(post_prob[,2] > post_prob[,1]))
+}
+postodds <- cbind(model_data$Player, postodds)
+names(postodds) <- c("Player", "2016-2017", "2015-2016")
+kable(postodds)
+```
