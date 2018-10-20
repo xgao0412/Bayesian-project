@@ -1,0 +1,337 @@
+---
+title: "project"
+author: "Xiang Gao"
+date: "2017年12月3日"
+output: html_document
+---
+
+Topic:Estimating the shooting efficiency of top NBA point guard.
+
+Background: As we all know,a point guard controll the court by passing the ball to the player who is wide open. He is a decision maker to deliver assists or finish the attack by himself. The question arises, who has the highest shooting percentage among the top NBA point guards. Is this related to the professional years of experience.
+
+I am using logistic regression to assess the probablity of shooting, also use a binomial model to estimate FGM. In order to build a hierachical model, each player is treated as a individual group by introducing a random effect called player effect. What's more, recent three years data will be used to check the continuous improvement.
+
+
+data cleaning. 
+```{r}
+library(readxl)
+data <- read_excel('data_NBAstats.xlsx')
+data <- as.data.frame(data)
+data
+```
+
+JAGS model. I will use scaled-t1 on coefficients in beta. and a flat uniform distribution for sigma of player effect
+```{r,eval=F}
+
+data {
+  dimY <- dim(FGM)
+}
+model {
+  for (i in 1:dimY[1]) {
+    for (j in 1:dimY[2]) {
+      
+      FGM[i,j] ~ dbin(prob[i,j],FGA[i,j])
+      logit(prob[i,j]) <- beta.Year[i]*Yr.Exper[i,j]+Player.Effect[i]
+	  
+	  
+      FGMrep[i,j] ~ dbin(prob[i,j],FGA[i,j])
+    }
+    
+
+      beta.Year[i] ~ dt(0,0.16,1)
+      Player.Effect[i] ~ dnorm(mu, 1/sigmaPE^2)
+  }
+
+  sigmaPE ~ dunif(0,100)
+  mu ~ dt(0,0.01,1)
+
+}
+```
+
+Subset out the FGM(field goal made),FGA(field goal attempt),Yr.Exper(Years of professional experience)
+```{r}
+d1 <- list(FGM = data[,c(2,7,12)],
+           FGA = data[,c(3,8,13)],
+           Yr.Exper = data[,c(6,11,16)])
+
+```
+
+Initialization of 4 chains
+```{r}
+inits1 <- list(list(beta.Year=c(-10,-10,-10,-10,-10,-10,-10,-10),mu=10, sigmaPE=0.001),
+               list(beta.Year=c(-10,-10,-10,-10,-10,-10,-10,-10),mu=-10,sigmaPE=99),
+               list(beta.Year=c(-10,-10,-10,-10,-10,-10,-10,-10),mu=10,sigmaPE=99),
+               list(beta.Year=c(-10,-10,-10,-10,-10,-10,-10,-10),mu=-10,sigmaPE=0.01))
+```
+
+```{r}
+inits1 <- list(list(beta.Year=c(-3,-3,-3,-3,-3,-3,-3,-3),mu=10, sigmaPE=0.001),
+               list(beta.Year=c(-3,-3,-3,-3,-3,-3,-3,-3),mu=-10,sigmaPE=99),
+               list(beta.Year=c(-3,-3,-3,-3,-3,-3,-3,-3),mu=10,sigmaPE=99),
+               list(beta.Year=c(-3,-3,-3,-3,-3,-3,-3,-3),mu=-10,sigmaPE=0.01))
+```
+
+```{r}
+inits1 <- list(list(beta.Year=c(-1,-1,-1,-1,-1,-1,-1,-1),mu=10, sigmaPE=0.001),
+               list(beta.Year=c(-1,-1,-1,-1,-1,-1,-1,-1),mu=-10,sigmaPE=99),
+               list(beta.Year=c(-1,-1,-1,-1,-1,-1,-1,-1),mu=10,sigmaPE=99),
+               list(beta.Year=c(-1,-1,-1,-1,-1,-1,-1,-1),mu=-10,sigmaPE=0.01))
+```
+build model
+```{r}
+library(rjags)
+m1 <- jags.model('model-logistic.bug',d1,inits1,n.chains = 4,n.adapt = 1000)
+```
+
+Burning and check convergence
+```{r}
+update(m1,250000)
+
+x1 <- coda.samples(m1,c('beta.Year','Player.Effect'), n.iter = 10000)
+
+gelman.diag(x1,autoburnin = F)
+```
+
+
+```{r}
+x1 <- coda.samples(m1,c('beta.Year','Player.Effect','prob','FGMrep'), n.iter=100000)
+```
+
+
+```{r}
+effectiveSize(x1)
+```
+
+Effective samples sizes are adequate.
+
+
+Check overdispersion, chi-square discrepancy
+
+```{r}
+df <- as.matrix(x1)
+probs1 <- df[,paste('prob[',1:8, ',',1,']',sep='')]
+probs2 <- df[,paste('prob[',1:8, ',',2,']',sep='')]
+probs3 <- df[,paste('prob[',1:8, ',',3,']',sep='')]
+probs <-  cbind(probs1,probs2,probs3)
+
+FGMrep1 <- df[,paste('FGMrep[',1:8, ',',1,']',sep='')]
+FGMrep2 <- df[,paste('FGMrep[',1:8, ',',2,']',sep='')]
+FGMrep3 <- df[,paste('FGMrep[',1:8, ',',3,']',sep='')]
+FGMrep <-  cbind(FGMrep1,FGMrep2,FGMrep3)
+
+FGM.v <- unlist(d1$FGM)
+FGA.v <- unlist(d1$FGA)
+```
+
+Chi-square
+```{r}
+
+Tchi <- matrix(NA,nrow(FGMrep),24)
+Tchirep <- matrix(NA,nrow(FGMrep),24)
+for (s in 1:nrow(FGMrep)){
+        Tchi[s,] <- sum((FGM.v - FGA.v*probs[s,])^2/(FGA.v*probs[s,]*(1-probs[s,])))
+        Tchirep[s,] <- sum((FGMrep[s,] - FGA.v*probs[s,])^2/(FGA.v*probs[s,]*(1-probs[s,])))
+}
+```
+
+```{r}
+mean(Tchirep>=Tchi)
+```
+No over dispersion problem
+
+Check Stephen Curry successfully makes an attempted field goal for the past three years.
+
+```{r}
+ilogit <-  function(x) 1/(1+exp(-x))
+beta.Year.SC <- df[,'beta.Year[2]']
+player.Effect.SC <- df[,'Player.Effect[2]']
+
+newprob.SC17 <- numeric(nrow(probs1))
+for (s in 1:nrow(probs1)) {
+  newprob.SC17[s] <- ilogit(beta.Year.SC[s]*8+player.Effect.SC[s])
+}
+```
+
+```{r}
+newprob.SC16 <- numeric(nrow(probs1))
+for (s in 1:nrow(probs1)) {
+  newprob.SC16[s] <- ilogit(beta.Year.SC[s]*7+player.Effect.SC[s])
+}
+```
+
+```{r}
+newprob.SC15 <- numeric(nrow(probs1))
+for (s in 1:nrow(probs1)) {
+  newprob.SC15[s] <- ilogit(beta.Year.SC[s]*6+player.Effect.SC[s])
+}
+
+newprob.SC <- cbind(newprob.SC15,newprob.SC16,newprob.SC17)
+```
+
+density plot from 2015 to 2017
+
+```{r}
+library(UsingR)
+densityplot(newprob.SC[,3])
+```
+
+```{r}
+densityplot(newprob.SC[,2])
+
+```
+
+
+```{r}
+densityplot(newprob.SC[,1])
+
+```
+
+The posterior density does not show Stephen's improvement of making a field goal, let's also check Russell Westbrook.
+
+```{r}
+beta.Year.Rw <- df[,'beta.Year[1]']
+player.Effect.Rw <- df[,'Player.Effect[1]']
+
+newprob.Rw17 <- numeric(nrow(probs1))
+for (s in 1:nrow(probs1)) {
+  newprob.Rw17[s] <- ilogit(beta.Year.Rw[s]*9+player.Effect.Rw[s])
+}
+densityplot(newprob.Rw17)
+```
+
+```{r}
+newprob.Rw16 <- numeric(nrow(probs1))
+for (s in 1:nrow(probs1)) {
+  newprob.Rw16[s] <- ilogit(beta.Year.Rw[s]*8+player.Effect.Rw[s])
+}
+densityplot(newprob.Rw16)
+```
+
+
+```{r}
+newprob.Rw15 <- numeric(nrow(probs1))
+for (s in 1:nrow(probs1)) {
+  newprob.Rw15[s] <- ilogit(beta.Year.Rw[s]*7+player.Effect.Rw[s])
+}
+densityplot(newprob.Rw15)
+```
+Not much improvement either. Let's check Kyrie Irving.
+
+```{r}
+beta.Year.KI <- df[,'beta.Year[4]']
+player.Effect.KI <- df[,'Player.Effect[4]']
+
+newprob.KI17 <- numeric(nrow(probs1))
+for (s in 1:nrow(probs1)) {
+  newprob.KI17[s] <- ilogit(beta.Year.KI[s]*6+player.Effect.KI[s])
+}
+densityplot(newprob.KI17)
+```
+
+```{r}
+newprob.KI16 <- numeric(nrow(probs1))
+for (s in 1:nrow(probs1)) {
+  newprob.KI16[s] <- ilogit(beta.Year.KI[s]*5+player.Effect.KI[s])
+}
+densityplot(newprob.KI16)
+```
+
+
+```{r}
+newprob.KI15 <- numeric(nrow(probs1))
+for (s in 1:nrow(probs1)) {
+  newprob.KI15[s] <- ilogit(beta.Year.KI[s]*4+player.Effect.KI[s])
+}
+densityplot(newprob.KI15)
+```
+Kyrie shows about one percent improvement
+
+Let's check Giannis Antetolounmpo
+```{r}
+beta.Year.GA <- df[,'beta.Year[7]']
+player.Effect.GA <- df[,'Player.Effect[7]']
+
+newprob.GA17 <- numeric(nrow(probs1))
+for (s in 1:nrow(probs1)) {
+  newprob.GA17[s] <- ilogit(beta.Year.GA[s]*4+player.Effect.GA[s])
+}
+densityplot(newprob.GA17)
+```
+
+```{r}
+newprob.GA16 <- numeric(nrow(probs1))
+for (s in 1:nrow(probs1)) {
+  newprob.GA16[s] <- ilogit(beta.Year.GA[s]*3+player.Effect.GA[s])
+}
+densityplot(newprob.GA16)
+```
+
+
+```{r}
+newprob.GA15 <- numeric(nrow(probs1))
+for (s in 1:nrow(probs1)) {
+  newprob.GA15[s] <- ilogit(beta.Year.GA[s]*2+player.Effect.GA[s])
+}
+densityplot(newprob.GA15)
+```
+Giannis shows great improvement from 48% to 52%, even with only a couple of years experience
+
+I am also interested in player effect. I want to see comparison of the posterior probability of player effect.
+
+The player effect of Russell bigger than Stephen.
+```{r}
+mean(df[,'Player.Effect[1]']>df[,'Player.Effect[2]'])
+
+```
+Stephen > James Harden
+```{r}
+mean(df[,'Player.Effect[2]']>df[,'Player.Effect[3]'])
+```
+
+Stephen > Kyrie Irving
+```{r}
+mean(df[,'Player.Effect[2]']>df[,'Player.Effect[4]'])
+```
+
+Stephen > Giannis
+
+```{r}
+mean(df[,'Player.Effect[1]']>df[,'Player.Effect[7]'])
+```
+There is evidence that Giannis has the biggest player impact.
+
+This project shows that the shooting accuracy doesn't have a strong relationship with years of  professional experience. The player's personal effect is still the major impact. This is related to the basketball DNA that guided the player to make a better decision not to pass but taking over and make an attempted basket.
+On the other hand, a point guard is not easily trained for making a good decision.
+
+check marginal posterior predictive p-value of (FGMrep[i]>y[i])
+
+```{r}
+FGM.p17 <- numeric(8)
+for (s in 1:8) {
+  FGM.p17[s] <- mean(FGMrep1[,s]>=d1$FGM[s,1])     
+}
+
+```
+
+```{r}
+FGM.p16 <- numeric(8)
+for (s in 1:8) {
+  FGM.p16[s] <- mean(FGMrep2[,s]>=d1$FGM[s,2])     
+}
+
+```
+
+```{r}
+FGM.p15 <- numeric(8)
+for (s in 1:8) {
+  FGM.p15[s] <- mean(FGMrep3[,s]>=d1$FGM[s,3])     
+}
+
+```
+
+table
+```{r}
+FGM.p <- data.frame(data[,1],FGM.p17,FGM.p16,FGM.p15)
+FGM.p
+```
+
